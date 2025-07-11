@@ -1,70 +1,97 @@
 <?php
 
-require_once 'models/User.php';
 require_once 'models/Match.php';
 require_once 'models/Bet.php';
+require_once 'models/User.php';
+require_once 'models/Settings.php';
 require_once 'core/Session.php';
 require_once 'core/Helpers.php';
 
 class MatchController {
-    private $userModel;
     private $matchModel;
     private $betModel;
+    private $userModel;
+    private $settings;
     
     public function __construct() {
-        $this->userModel = new User();
         $this->matchModel = new Match();
         $this->betModel = new Bet();
+        $this->userModel = new User();
+        $this->settings = new Settings();
     }
     
     public function index() {
         $upcomingMatches = $this->matchModel->getUpcomingMatches();
         $liveMatches = $this->matchModel->getLiveMatches();
-        $finishedMatches = $this->matchModel->getFinishedMatches(5);
+        $finishedMatches = $this->matchModel->getFinishedMatches(10);
         $recentWinners = $this->betModel->getRecentWinners(5);
         
         require_once 'views/home.php';
     }
     
-    public function dashboard() {
-        if (!Session::isLoggedIn()) {
-            Helpers::redirect('/login');
+    public function matches() {
+        $filter = $_GET['filter'] ?? 'all';
+        $league = $_GET['league'] ?? '';
+        $date = $_GET['date'] ?? '';
+        
+        switch ($filter) {
+            case 'upcoming':
+                $matches = $this->matchModel->getUpcomingMatches();
+                break;
+            case 'live':
+                $matches = $this->matchModel->getLiveMatches();
+                break;
+            case 'finished':
+                $matches = $this->matchModel->getFinishedMatches(50);
+                break;
+            case 'today':
+                $matches = $this->matchModel->getTodaysMatches();
+                break;
+            default:
+                $matches = $this->matchModel->getAllMatches();
         }
         
-        $userId = Session::getUserId();
-        $user = $this->userModel->findById($userId);
-        $userBets = $this->betModel->getUserBets($userId, 10);
-        $userStats = $this->betModel->getUserStats($userId);
-        $upcomingMatches = $this->matchModel->getUpcomingMatches();
+        // Filter by league if specified
+        if ($league) {
+            $matches = array_filter($matches, function($match) use ($league) {
+                return $match['league'] === $league;
+            });
+        }
         
-        require_once 'views/dashboard.php';
-    }
-    
-    public function matches() {
-        $upcomingMatches = $this->matchModel->getUpcomingMatches();
-        $liveMatches = $this->matchModel->getLiveMatches();
-        $finishedMatches = $this->matchModel->getFinishedMatches(20);
+        // Filter by date if specified
+        if ($date) {
+            $matches = array_filter($matches, function($match) use ($date) {
+                return date('Y-m-d', strtotime($match['match_date'])) === $date;
+            });
+        }
+        
+        $leagues = $this->matchModel->getLeagues();
         
         require_once 'views/matches.php';
     }
     
-    public function showMatch() {
-        $matchId = $_GET['id'] ?? null;
-        if (!$matchId) {
-            Helpers::redirect('/matches');
-        }
-        
+    public function match() {
+        $matchId = (int) ($_GET['id'] ?? 0);
         $match = $this->matchModel->findById($matchId);
+        
         if (!$match) {
             Session::setFlash('error', 'Match not found.');
-            Helpers::redirect('/matches');
+            header('Location: /matches');
+            return;
         }
         
-        $matchBets = $this->betModel->getMatchBets($matchId);
-        $userBalance = 0;
+        // Get match statistics
+        $matchStats = $this->matchModel->getMatchStats($matchId);
+        $betsSummary = $this->betModel->getMatchBetsSummary($matchId);
         
+        // Get user's previous bets on this match (if logged in)
+        $userBets = [];
         if (Session::isLoggedIn()) {
-            $userBalance = $this->userModel->getBalance(Session::getUserId());
+            $userId = Session::get('user_id');
+            $allUserBets = $this->betModel->getUserBets($userId);
+            $userBets = array_filter($allUserBets, function($bet) use ($matchId) {
+                return $bet['match_id'] == $matchId;
+            });
         }
         
         require_once 'views/match_detail.php';
@@ -72,134 +99,333 @@ class MatchController {
     
     public function placeBet() {
         if (!Session::isLoggedIn()) {
-            Session::setFlash('error', 'Please login to place bets.');
-            Helpers::redirect('/login');
+            header('Location: /login');
+            return;
         }
         
         if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
-            Helpers::redirect('/matches');
+            header('Location: /matches');
+            return;
         }
         
-        $matchId = $_POST['match_id'];
-        $betType = $_POST['bet_type']; // 'home', 'away', 'draw'
-        $amount = floatval($_POST['amount']);
-        $userId = Session::getUserId();
+        $matchId = (int) ($_POST['match_id'] ?? 0);
+        $betType = $_POST['bet_type'] ?? ''; // '1x2', 'over_under', 'btts'
+        $selectedOption = $_POST['selected_option'] ?? ''; // 'home', 'away', 'draw', 'over', 'under', 'yes', 'no'
+        $stake = (float) ($_POST['stake'] ?? 0);
+        
+        $userId = Session::get('user_id');
+        $user = $this->userModel->findById($userId);
+        $match = $this->matchModel->findById($matchId);
         
         // Validation
         $errors = [];
         
-        // Check if match exists and is upcoming
-        $match = $this->matchModel->findById($matchId);
         if (!$match) {
-            $errors[] = 'Match not found.';
-        } elseif ($match['status'] !== 'upcoming') {
+            $errors[] = 'Invalid match selected.';
+        } elseif ($match['status'] !== 'upcoming' || $match['betting_locked']) {
             $errors[] = 'Betting is closed for this match.';
         } elseif (strtotime($match['match_date']) <= time()) {
-            $errors[] = 'Betting is closed for this match.';
+            $errors[] = 'Match has already started.';
         }
         
-        // Check bet type
-        if (!in_array($betType, ['home', 'away', 'draw'])) {
-            $errors[] = 'Invalid bet type.';
+        $minBet = $this->settings->getMinBet();
+        $maxBet = $this->settings->getMaxBet();
+        
+        if ($stake < $minBet) {
+            $errors[] = "Minimum bet amount is $" . number_format($minBet, 2);
         }
         
-        // Check amount
-        if ($amount <= 0) {
-            $errors[] = 'Bet amount must be greater than 0.';
-        } elseif ($amount < 1) {
-            $errors[] = 'Minimum bet amount is $1.';
+        if ($stake > $maxBet) {
+            $errors[] = "Maximum bet amount is $" . number_format($maxBet, 2);
         }
         
-        // Check user balance
-        $userBalance = $this->userModel->getBalance($userId);
-        if ($amount > $userBalance) {
-            $errors[] = 'Insufficient balance.';
+        if ($stake > $user['balance']) {
+            $errors[] = 'Insufficient balance to place this bet.';
+        }
+        
+        // Validate bet type and get odds
+        $odds = $this->getOddsForBet($match, $betType, $selectedOption);
+        if (!$odds) {
+            $errors[] = 'Invalid bet selection.';
         }
         
         if (!empty($errors)) {
-            Session::setFlash('error', implode('<br>', $errors));
-            Helpers::redirect("/match/{$matchId}");
-        }
-        
-        // Get odds for the bet type
-        $odds = 0;
-        switch ($betType) {
-            case 'home':
-                $odds = $match['home_odds'];
-                break;
-            case 'away':
-                $odds = $match['away_odds'];
-                break;
-            case 'draw':
-                $odds = $match['draw_odds'];
-                break;
-        }
-        
-        // Deduct amount from user balance
-        if ($this->userModel->deductBalance($userId, $amount)) {
-            // Create bet
-            $betData = [
-                'user_id' => $userId,
-                'match_id' => $matchId,
-                'bet_type' => $betType,
-                'amount' => $amount,
-                'odds' => $odds
-            ];
-            
-            if ($this->betModel->create($betData)) {
-                $potentialWin = $amount * $odds;
-                Session::setFlash('success', "Bet placed successfully! Potential win: " . Helpers::formatMoney($potentialWin));
-            } else {
-                // Refund the amount if bet creation failed
-                $this->userModel->updateBalance($userId, $amount);
-                Session::setFlash('error', 'Failed to place bet. Please try again.');
+            foreach ($errors as $error) {
+                Session::setFlash('error', $error);
             }
-        } else {
-            Session::setFlash('error', 'Failed to process bet. Insufficient balance.');
+            header('Location: /match?id=' . $matchId);
+            return;
         }
         
-        Helpers::redirect("/match/{$matchId}");
+        // Create bet
+        $betData = [
+            'user_id' => $userId,
+            'match_id' => $matchId,
+            'bet_type' => $betType,
+            'selected_option' => $selectedOption,
+            'stake' => $stake,
+            'odds' => $odds
+        ];
+        
+        if ($this->betModel->create($betData)) {
+            // Update user balance in session
+            Session::set('user_balance', $user['balance'] - $stake);
+            
+            $potentialWin = $stake * $odds;
+            Session::setFlash('success', "Bet placed successfully! Potential win: $" . number_format($potentialWin, 2));
+        } else {
+            Session::setFlash('error', 'Failed to place bet. Please try again.');
+        }
+        
+        header('Location: /match?id=' . $matchId);
     }
     
-    public function myBets() {
-        if (!Session::isLoggedIn()) {
-            Helpers::redirect('/login');
+    private function getOddsForBet($match, $betType, $selectedOption) {
+        switch ($betType) {
+            case '1x2':
+                switch ($selectedOption) {
+                    case 'home':
+                        return $match['home_odds'];
+                    case 'away':
+                        return $match['away_odds'];
+                    case 'draw':
+                        return $match['draw_odds'];
+                }
+                break;
+            case 'over_under':
+                switch ($selectedOption) {
+                    case 'over':
+                        return $match['over_25_odds'];
+                    case 'under':
+                        return $match['under_25_odds'];
+                }
+                break;
+            case 'btts':
+                switch ($selectedOption) {
+                    case 'yes':
+                        return $match['btts_yes_odds'];
+                    case 'no':
+                        return $match['btts_no_odds'];
+                }
+                break;
         }
         
-        $userId = Session::getUserId();
-        $userBets = $this->betModel->getUserBets($userId);
+        return false;
+    }
+    
+    public function dashboard() {
+        if (!Session::isLoggedIn()) {
+            header('Location: /login');
+            return;
+        }
+        
+        $userId = Session::get('user_id');
+        $user = $this->userModel->findById($userId);
+        
+        // Get user betting statistics
         $userStats = $this->betModel->getUserStats($userId);
         
-        require_once 'views/my_bets.php';
+        // Get recent bets
+        $recentBets = $this->betModel->getUserBets($userId, 10);
+        
+        // Get upcoming matches
+        $upcomingMatches = $this->matchModel->getUpcomingMatches();
+        $upcomingMatches = array_slice($upcomingMatches, 0, 5); // Limit to 5
+        
+        // Get recent transactions
+        $transactions = $this->userModel->getUserTransactions($userId, 10);
+        
+        // Get deposit and withdrawal requests
+        $depositRequests = $this->userModel->getUserDepositRequests($userId);
+        $withdrawalRequests = $this->userModel->getUserWithdrawalRequests($userId);
+        
+        require_once 'views/dashboard.php';
     }
     
-    public function results() {
-        $finishedMatches = $this->matchModel->getFinishedMatches(50);
-        require_once 'views/results.php';
-    }
-    
-    public function live() {
-        $liveMatches = $this->matchModel->getLiveMatches();
-        require_once 'views/live.php';
-    }
-    
-    public function leagues() {
-        $leagues = $this->matchModel->getLeagues();
-        require_once 'views/leagues.php';
-    }
-    
-    public function showLeague() {
-        $league = $_GET['name'] ?? null;
-        if (!$league) {
-            Helpers::redirect('/leagues');
+    public function betHistory() {
+        if (!Session::isLoggedIn()) {
+            header('Location: /login');
+            return;
         }
         
-        $matches = $this->matchModel->getMatchesByLeague($league);
-        require_once 'views/league_matches.php';
+        $userId = Session::get('user_id');
+        $status = $_GET['status'] ?? null;
+        $page = (int) ($_GET['page'] ?? 1);
+        $perPage = 20;
+        
+        $bets = $this->betModel->getUserBetHistory($userId, $status, $perPage);
+        $userStats = $this->betModel->getUserStats($userId);
+        
+        require_once 'views/bet_history.php';
     }
     
-    public function winners() {
-        $recentWinners = $this->betModel->getRecentWinners(50);
-        require_once 'views/winners.php';
+    public function liveScores() {
+        $liveMatches = $this->matchModel->getLiveMatches();
+        $finishedMatches = $this->matchModel->getFinishedMatches(20);
+        
+        // For AJAX requests, return JSON
+        if (isset($_GET['ajax']) && $_GET['ajax'] === '1') {
+            header('Content-Type: application/json');
+            echo json_encode([
+                'live' => $liveMatches,
+                'finished' => $finishedMatches
+            ]);
+            return;
+        }
+        
+        require_once 'views/live_scores.php';
+    }
+    
+    public function search() {
+        $query = trim($_GET['q'] ?? '');
+        $matches = [];
+        
+        if (strlen($query) >= 2) {
+            $matches = $this->matchModel->searchMatches($query);
+        }
+        
+        // For AJAX requests, return JSON
+        if (isset($_GET['ajax']) && $_GET['ajax'] === '1') {
+            header('Content-Type: application/json');
+            echo json_encode($matches);
+            return;
+        }
+        
+        require_once 'views/search_results.php';
+    }
+    
+    public function odds() {
+        $matchId = (int) ($_GET['match_id'] ?? 0);
+        
+        if ($matchId) {
+            $odds = $this->matchModel->getMatchOdds($matchId);
+            header('Content-Type: application/json');
+            echo json_encode($odds);
+        } else {
+            header('HTTP/1.1 400 Bad Request');
+            echo json_encode(['error' => 'Invalid match ID']);
+        }
+    }
+    
+    public function calculatePayout() {
+        $stake = (float) ($_GET['stake'] ?? 0);
+        $odds = (float) ($_GET['odds'] ?? 0);
+        
+        if ($stake > 0 && $odds > 1) {
+            $payout = $stake * $odds;
+            $profit = $payout - $stake;
+            
+            header('Content-Type: application/json');
+            echo json_encode([
+                'stake' => number_format($stake, 2),
+                'odds' => number_format($odds, 2),
+                'payout' => number_format($payout, 2),
+                'profit' => number_format($profit, 2)
+            ]);
+        } else {
+            header('HTTP/1.1 400 Bad Request');
+            echo json_encode(['error' => 'Invalid stake or odds']);
+        }
+    }
+    
+    public function validateBet() {
+        if (!Session::isLoggedIn()) {
+            header('HTTP/1.1 401 Unauthorized');
+            echo json_encode(['error' => 'Not logged in']);
+            return;
+        }
+        
+        $matchId = (int) ($_POST['match_id'] ?? 0);
+        $stake = (float) ($_POST['stake'] ?? 0);
+        $betType = $_POST['bet_type'] ?? '';
+        $selectedOption = $_POST['selected_option'] ?? '';
+        
+        $userId = Session::get('user_id');
+        $user = $this->userModel->findById($userId);
+        $match = $this->matchModel->findById($matchId);
+        
+        $errors = [];
+        $warnings = [];
+        
+        // Validate match
+        if (!$match) {
+            $errors[] = 'Invalid match selected.';
+        } elseif ($match['status'] !== 'upcoming' || $match['betting_locked']) {
+            $errors[] = 'Betting is closed for this match.';
+        } elseif (strtotime($match['match_date']) <= time()) {
+            $errors[] = 'Match has already started.';
+        }
+        
+        // Validate stake
+        $minBet = $this->settings->getMinBet();
+        $maxBet = $this->settings->getMaxBet();
+        
+        if ($stake < $minBet) {
+            $errors[] = "Minimum bet amount is $" . number_format($minBet, 2);
+        }
+        
+        if ($stake > $maxBet) {
+            $errors[] = "Maximum bet amount is $" . number_format($maxBet, 2);
+        }
+        
+        if ($stake > $user['balance']) {
+            $errors[] = 'Insufficient balance to place this bet.';
+        }
+        
+        // Check if user already has bets on this match
+        $userBets = $this->betModel->getUserBets($userId);
+        $existingBets = array_filter($userBets, function($bet) use ($matchId) {
+            return $bet['match_id'] == $matchId && $bet['status'] === 'pending';
+        });
+        
+        if (count($existingBets) >= 3) {
+            $warnings[] = 'You already have multiple bets on this match.';
+        }
+        
+        // Validate bet type and get odds
+        $odds = $this->getOddsForBet($match, $betType, $selectedOption);
+        if (!$odds) {
+            $errors[] = 'Invalid bet selection.';
+        }
+        
+        header('Content-Type: application/json');
+        echo json_encode([
+            'valid' => empty($errors),
+            'errors' => $errors,
+            'warnings' => $warnings,
+            'odds' => $odds,
+            'potential_payout' => $odds ? $stake * $odds : 0
+        ]);
+    }
+    
+    public function popularMatches() {
+        $limit = (int) ($_GET['limit'] ?? 10);
+        $matches = $this->matchModel->getPopularMatches($limit);
+        
+        header('Content-Type: application/json');
+        echo json_encode($matches);
+    }
+    
+    public function matchCountdown() {
+        $matchId = (int) ($_GET['match_id'] ?? 0);
+        $match = $this->matchModel->findById($matchId);
+        
+        if ($match) {
+            $matchTime = strtotime($match['match_date']);
+            $currentTime = time();
+            $timeLeft = $matchTime - $currentTime;
+            
+            header('Content-Type: application/json');
+            echo json_encode([
+                'match_time' => $matchTime,
+                'current_time' => $currentTime,
+                'time_left' => max(0, $timeLeft),
+                'status' => $match['status'],
+                'betting_locked' => $match['betting_locked']
+            ]);
+        } else {
+            header('HTTP/1.1 404 Not Found');
+            echo json_encode(['error' => 'Match not found']);
+        }
     }
 }
